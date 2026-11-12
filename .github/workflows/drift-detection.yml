@@ -1,0 +1,63 @@
+name: Drift Detection (manual)
+
+# Manual-only for now. This reference repo has no AWS role configured, so a nightly schedule would only
+# produce failing runs. Once the loop is commissioned (README Part 8), re-enable the schedule by adding:
+#   schedule:
+#     - cron: '0 2 * * *'   # 02:00 UTC nightly
+on:
+  workflow_dispatch:        # run manually from the Actions tab
+
+jobs:
+  drift-detection:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write       # required for OIDC AWS auth
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Conditional: skipped gracefully if AWS_CI_ROLE_ARN is not yet configured.
+      # The drift script handles missing AWS credentials by noting "not connected" in findings.
+      - name: Configure AWS credentials (OIDC)
+        id: aws-auth
+        if: ${{ secrets.AWS_CI_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: eu-west-1
+
+      # Only runs if AWS credentials are available — requires a live EKS cluster.
+      - name: Set up kubectl and flux
+        if: steps.aws-auth.outcome == 'success'
+        run: |
+          aws eks update-kubeconfig --name prod-cluster --region eu-west-1
+          # Pinned version and SHA-256 (from the publisher's flux_2.3.0_checksums.txt); bump both together.
+          FLUX_VERSION=2.3.0
+          FLUX_SHA256=51ef10a0ebf2078e52476c4d168200a1db73feef987e0bc8722f4ce4fcd4b6d9
+          curl -fsSL -o /tmp/flux.tar.gz "https://github.com/fluxcd/flux2/releases/download/v${FLUX_VERSION}/flux_${FLUX_VERSION}_linux_amd64.tar.gz"
+          echo "${FLUX_SHA256}  /tmp/flux.tar.gz" | sha256sum -c -
+          tar -xz -C /usr/local/bin -f /tmp/flux.tar.gz flux
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.322   # pinned; bump deliberately
+
+      # Always runs — the drift script handles gracefully whichever surfaces are not yet connected.
+      - name: Run drift detection loop
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Optional: set if routing Claude through Azure AI Foundry instead of Anthropic API directly.
+          # Add ANTHROPIC_BASE_URL as a repository secret with your Azure AI Foundry endpoint.
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+        run: bash loops/drift-detection.sh
+
+      # Always runs — uploads whatever findings were produced, even on partial runs.
+      # if: always() ensures this runs even when drift is detected (exit 1 from drift-detection.sh).
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: drift-findings-${{ github.run_id }}
+          path: state/drift-*.json
+          if-no-files-found: warn
+          retention-days: 30

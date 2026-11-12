@@ -1,0 +1,71 @@
+name: PR Policy Check
+
+on:
+  pull_request:
+    paths:
+      - 'terraform/**'
+      - 'clusters/**'
+      - 'policies/**'
+
+jobs:
+  policy-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write        # required for OIDC AWS auth
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Conditional: skipped gracefully if AWS_CI_ROLE_ARN is not yet configured.
+      # Without credentials, terraform plan is skipped but checkov/OPA still run against source files.
+      - name: Configure AWS credentials (OIDC)
+        id: aws-auth
+        if: ${{ secrets.AWS_CI_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: eu-west-1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: "1.10.5"   # pinned; bump deliberately
+
+      - name: Install checkov and OPA
+        run: |
+          # Pinned versions; bump deliberately. OPA is verified against the publisher's SHA-256.
+          pip install checkov==3.4.5
+          OPA_VERSION=v1.22.4
+          OPA_SHA256=b76461cf4db0f77946ef557d727a1da5d7a22ba930844678c9be0bebd2c9d0f6
+          curl -fsSL -o /usr/local/bin/opa "https://openpolicyagent.org/downloads/${OPA_VERSION}/opa_linux_amd64"
+          echo "${OPA_SHA256}  /usr/local/bin/opa" | sha256sum -c -
+          chmod +x /usr/local/bin/opa
+
+      # Only runs if AWS credentials are available — terraform plan needs backend access.
+      - name: Terraform init (all changed module directories)
+        if: steps.aws-auth.outcome == 'success'
+        run: |
+          git diff --name-only origin/main...HEAD \
+            | grep -E '\.tf$' \
+            | sed 's|/[^/]*\.tf$||' \
+            | sort -u \
+            | while read -r dir; do
+                echo "Init: $dir"
+                terraform -chdir="$dir" init -backend=false -input=false
+              done
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.322   # pinned; bump deliberately
+
+      - name: Run policy check loop
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: set if routing Claude through Azure AI Foundry instead of Anthropic API directly.
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+        run: bash loops/pr-policy-check.sh

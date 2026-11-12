@@ -1,0 +1,42 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+  - pdb.yaml
+  - hpa.yaml
+  # peer-authentication.yaml requires Istio CRDs — omit on kind, include in prod overlay
+
+# Swap placeholder image for a real one so the pod runs on kind.
+# nginx-unprivileged: runs as uid 101 (non-root), listens on 8080 — matches the deployment spec.
+# Replace this with your actual registry image before deploying to prod.
+images:
+  - name: your-registry/checkout-service
+    newName: nginxinc/nginx-unprivileged
+    newTag: alpine
+
+patches:
+  # kind-only: prod image handles readOnlyRootFilesystem and /health; nginx-unprivileged needs
+  # to write pid/cache files, serves / not /health, and runs as uid 101 (not 1000).
+  # REMOVE THIS ENTIRE PATCHES BLOCK before deploying to prod — replace image with real registry image above.
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: checkout-service
+        namespace: platform
+      spec:
+        template:
+          spec:
+            securityContext:
+              runAsUser: 101
+            containers:
+              - name: checkout-service
+                securityContext:
+                  readOnlyRootFilesystem: false
+                readinessProbe:
+                  httpGet:
+                    path: /
+                livenessProbe:
+                  httpGet:
+                    path: /
